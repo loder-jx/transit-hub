@@ -85,6 +85,23 @@ func NewMetricsService(store SessionStore, platform PlatformClient, upstreams Up
 	return &MetricsService{store: store, platform: platform, upstreams: upstreams, metricsRepo: metricsRepo, accounts: accounts}
 }
 
+// businessLocation 返回业务统计使用的统一时区（Asia/Shanghai）。
+// LiveMetrics、Trends、午夜调度必须用同一时区定义"今天"：容器本地时间是 UTC 时，
+// 北京时间 0-8 点窗口内 time.Now() 的日期仍是前一天，会把新一天的实时成本
+// 错误地 upsert 进昨天的快照行，同时趋势图会把昨天当成"今天"排除掉。
+func businessLocation() *time.Location {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		return time.UTC
+	}
+	return loc
+}
+
+// businessToday 返回业务时区下的今天日期（YYYY-MM-DD）。
+func businessToday() string {
+	return time.Now().In(businessLocation()).Format("2006-01-02")
+}
+
 // LiveMetrics 实时计算五项核心指标并返回。
 // 同时将当天的指标作为快照 upsert 到数据库，确保趋势图数据持续积累。
 //
@@ -121,7 +138,8 @@ func (s *MetricsService) LiveMetrics(ctx context.Context, userID string) (Metric
 
 	// 并行获取四项独立数据：今日盈利、站点余额、分组数量、上游指标。
 	// 各 goroutine 出错只记日志、降级为零值，不阻塞整体返回。
-	today := time.Now().Format("2006-01-02")
+	// "今天"按业务时区（Asia/Shanghai）计算，与上游平台的按天口径和午夜调度保持一致。
+	today := businessToday()
 	var (
 		todayProfit     float64
 		siteBalance     float64
@@ -224,7 +242,7 @@ func (s *MetricsService) Trends(ctx context.Context, userID string, days int) (T
 	if err != nil {
 		return TrendResponse{}, err
 	}
-	snapshots, err := s.metricsRepo.ListRange(ctx, userID, adminAccountID, days)
+	snapshots, err := s.metricsRepo.ListRange(ctx, userID, adminAccountID, days, businessToday())
 	if err != nil {
 		return TrendResponse{}, err
 	}
@@ -247,11 +265,7 @@ func (s *MetricsService) Trends(ctx context.Context, userID string, days int) (T
 // 确保即使用户当天未访问仪表盘，趋势图也不会出现空缺。
 func (s *MetricsService) StartScheduler(ctx context.Context) {
 	go func() {
-		loc, err := time.LoadLocation("Asia/Shanghai")
-		if err != nil {
-			log.Printf("dashboard scheduler: failed to load Asia/Shanghai timezone, using UTC: %v", err)
-			loc = time.UTC
-		}
+		loc := businessLocation()
 
 		for {
 			now := time.Now().In(loc)
@@ -289,11 +303,7 @@ func (s *MetricsService) snapshotAll(ctx context.Context) {
 		return
 	}
 
-	loc, _ := time.LoadLocation("Asia/Shanghai")
-	if loc == nil {
-		loc = time.UTC
-	}
-	yesterday := time.Now().In(loc).AddDate(0, 0, -1).Format("2006-01-02")
+	yesterday := time.Now().In(businessLocation()).AddDate(0, 0, -1).Format("2006-01-02")
 
 	for _, ref := range refs {
 		userID := ref.UserID
@@ -491,7 +501,7 @@ func (s *MetricsService) GroupUsageToday(ctx context.Context, userID string) (Gr
 	}
 
 	return GroupUsageTodayResponse{
-		Date:   time.Now().Format("2006-01-02"),
+		Date:   businessToday(),
 		Total:  total,
 		Groups: items,
 	}, nil
@@ -537,7 +547,7 @@ func (s *MetricsService) UpstreamKeyUsageToday(ctx context.Context, userID strin
 	}
 
 	return UpstreamKeyUsageTodayResponse{
-		Date:        time.Now().Format("2006-01-02"),
+		Date:        businessToday(),
 		Total:       total,
 		Keys:        responseItems,
 		FailedSites: failedSites,
